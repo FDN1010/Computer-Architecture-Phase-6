@@ -1,0 +1,14 @@
+## Edit the fields below to match your design. ##
+## Required fields:
+##     IF_ID_Instruction: # pipelined register that holds the instrucion being output from the IF stage, not the PC register.
+##     IF_ID_PC: # pipelined register that holds the PC being output from the IF stage.
+##     Data_Memory: # data memory registers
+## Optional fields:
+##     trace (list of signals to be printed in the trace file, in order of appearance in the trace file)
+
+IF_ID_Instruction: ("wInstr")
+IF_ID_PC: ("wPc")
+Data_Memory: ("data_cache", "dcache", "r_data")
+Instruction_Cache: ("instruction_cache", "icache", "r_data")
+Data_Cache: ("data_cache", "dcache", "r_data")
+trace: [id_stage_reg, ex_stage, wb_stage, hd, fwd]

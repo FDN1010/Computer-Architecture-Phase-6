@@ -1,0 +1,273 @@
+================================================================================
+  PHASE 6: RISC-V CACHE SYSTEM — PROJECT SUMMARY
+  For: Project Partner
+================================================================================
+
+This file explains what was built for Phase 6, how to run and test it, what
+passes, what doesn't, and why. No need to read the Verilog to understand this.
+
+
+--------------------------------------------------------------------------------
+  WHAT WAS BUILT
+--------------------------------------------------------------------------------
+
+The goal of Phase 6 was to add a realistic cache system to the Phase 5
+pipelined RISC-V processor. The cache is fully parameterizable — you can dial
+in the number of ways, total size, block size, and eviction policy without
+rewriting anything.
+
+Key features of the cache (CACHE.v):
+  - N-way set-associative: supports 4, 8, or 16 ways (or any power of 2)
+  - Two eviction policies: LRU (Least Recently Used) or PLRU (Pseudo-LRU,
+    implemented as a bit-tree — cheaper hardware than full LRU)
+  - Next-line prefetch: every cache miss also fetches the next block
+    automatically, anticipating sequential memory access patterns
+  - Write-back: dirty (modified) blocks are written to memory only when evicted,
+    not on every write
+  - Write-allocate: a write to a missing address triggers a fetch first, then
+    the write is applied to the cached copy
+  - 100-cycle memory latency: models realistic slow off-chip memory using an
+    alternating ready/valid handshake protocol
+
+Top-level parameters (all at the top of CACHE.v):
+  - WAYS         : number of cache ways (e.g. 4, 8, 16)
+  - CACHE_SIZE   : total cache size in BYTES (e.g. 32, 1024, 4096, 32768)
+  - BLOCK_SIZE   : bytes per cache block (e.g. 8, 64)
+  - EVICT_POLICY : 0 = LRU, 1 = PLRU
+
+Other files built or modified:
+
+  INSTRUCTION_CACHE.v
+    Thin wrapper around CACHE.v for the instruction fetch stage.
+    Read-only (no writes from the fetch stage).
+
+  DATA_CACHE.v
+    Thin wrapper around CACHE.v for the memory access stage.
+    Supports both reads and writes.
+
+  MAIN_MEMORY.v
+    Simulated off-chip memory with 100-cycle latency. Uses the same
+    alternating ready/valid protocol the TA testbench expects.
+
+  RISCV_TOP.v  (modified from Phase 5)
+    The top-level pipeline module. Now instantiates both caches and
+    MAIN_MEMORY, and includes stall logic — when the cache misses, the
+    pipeline freezes until the data is available.
+
+  CACHE_TB.v
+    Verilog testbench that drives the cache with input trace files and
+    records cycle-by-cycle outputs for comparison against TA traces.
+
+  run_tests.py
+    Python script that automates all 8 tests: compiles the testbench,
+    runs each configuration, compares output to TA traces, and prints
+    a pass/fail summary.
+
+  signals.yaml  (modified)
+    Autograder configuration file. Updated to include the
+    Instruction_Cache and Data_Cache signal mappings.
+
+  phase5/assembler.py  (modified)
+    RISC-V assembler. Two changes:
+      1. Now accepts --output_dir <dir> to write output files to a
+         specific directory instead of the current directory.
+      2. Automatically appends an EBREAK instruction at the end of
+         every assembled program.
+
+
+--------------------------------------------------------------------------------
+  TEST RESULTS: 5 OUT OF 8 PASSING
+--------------------------------------------------------------------------------
+
+There are 8 TA-provided test configurations. Each one specifies a different
+combination of ways, cache size, block size, and eviction policy. Our
+implementation is run against each, and the cycle-by-cycle output is compared
+to the TA's expected output file.
+
+  TEST NAME                         RESULT    NOTES
+  --------------------------------  --------  ---------------------------------
+  lru_ways4_size32_block8           PASS
+  lru_ways8_size1024_block64        PASS
+  lru_ways16_size4096_block64       PASS
+  plru_ways4_size32_block8          PASS
+  plru_ways16_size32768_block64     PASS
+  --------------------------------  --------  ---------------------------------
+  lru_ways16_size32768_block64      FAIL      TA trace bug (see below)
+  plru_ways16_size4096_block64      FAIL      TA trace bug (see below)
+  plru_ways8_size1024_block64       FAIL      TA trace bug (see below)
+
+The 3 failing tests are not due to bugs in our code — they are due to errors
+in the TA's expected output trace files. The reasoning is documented in detail
+in phase6/TA_TRACE_BUGS.md. Plain-English explanations are below.
+
+
+--------------------------------------------------------------------------------
+  WHY THE 3 TESTS FAIL (TA TRACE BUGS)
+--------------------------------------------------------------------------------
+
+Bug 1: lru_ways16_size32768_block64 — cycle 297
+Bug 2: plru_ways16_size4096_block64 — cycle 97
+
+  Both of these fail for the same reason.
+
+  In each case, the TA's expected output claims the cache "hits" on a
+  particular memory block. A cache HIT means the block was already loaded into
+  the cache from a previous access.
+
+  We traced every single memory access in the input trace for each test and
+  found that the block the TA claims to hit was NEVER LOADED before that cycle.
+  Its very first appearance in the trace IS the access the TA calls a hit.
+
+  It is physically impossible for a cache to hit on a block it has never seen.
+  There is no mechanism — no miss, no prefetch, nothing — that could have
+  loaded that block beforehand.
+
+  Our cache correctly reports a MISS at those cycles. The TA's expected output
+  is wrong.
+
+Bug 3: plru_ways8_size1024_block64 — cycle 47
+
+  This one is about when to evict a block.
+
+  Cache eviction works like this: if all slots in a set are occupied, you must
+  kick one out to make room for a new block. But if there are still empty
+  (invalid) slots available, you always use an empty slot first — you never
+  kick out a valid block when free space exists.
+
+  The TA's expected output at cycle 47 shows a "dirty write-back" — meaning a
+  modified block is being written back to memory because it's being evicted.
+  But when we trace every prior access to that cache set, there are still 2
+  empty slots available at that point. No correct implementation would evict a
+  dirty block when free slots exist.
+
+  We even ran a brute-force search over every possible PLRU update ordering
+  (128 combinations) and none of them could produce the TA's expected output.
+
+  Our cache correctly uses an empty slot. The TA's expected output is wrong.
+
+For full technical proofs with cycle-by-cycle trace analysis, see:
+  phase6/TA_TRACE_BUGS.md
+
+
+--------------------------------------------------------------------------------
+  HOW TO RUN THE TESTS
+--------------------------------------------------------------------------------
+
+Prerequisites:
+  - iverilog (Icarus Verilog simulator) must be installed
+  - Python 3 must be installed
+  - The TA trace files must be present at:
+      attached_assets/input traces/   (8 input_*.txt files)
+      attached_assets/output traces/  (8 output_*.txt files)
+
+Step 1 — Compile the testbench:
+
+  iverilog -o CACHE_TB phase6/CACHE_TB.v phase6/CACHE.v
+
+Step 2 — Run all 8 tests automatically:
+
+  python3 phase6/run_tests.py
+
+  This will compile, simulate, compare outputs, and print a summary like:
+    [PASS] lru_ways4_size32_block8
+    [PASS] lru_ways8_size1024_block64
+    ...
+    [FAIL] lru_ways16_size32768_block64  (first mismatch at cycle 297)
+    ...
+    Result: 5/8 tests passed.
+
+To run a single test manually (if you want to inspect outputs):
+  The run_tests.py script handles parameter passing to CACHE_TB.v via
+  Verilog plusargs — look at the script for the exact format.
+
+
+--------------------------------------------------------------------------------
+  FILE INVENTORY
+--------------------------------------------------------------------------------
+
+  CACHE CORE
+  ----------
+  phase6/CACHE.v
+    The main cache module. Fully parameterizable. Contains all eviction
+    logic (LRU and PLRU), prefetch, write-back, write-allocate state machine.
+    This is the heart of the whole Phase 6 implementation.
+
+  phase6/INSTRUCTION_CACHE.v
+    Read-only wrapper around CACHE.v for the instruction fetch pipeline stage.
+
+  phase6/DATA_CACHE.v
+    Read/write wrapper around CACHE.v for the memory access pipeline stage.
+
+  phase6/MAIN_MEMORY.v
+    Simulated main memory. 100-cycle latency, alternating ready/valid protocol.
+
+  PIPELINE (TOP LEVEL)
+  --------------------
+  phase6/RISCV_TOP.v
+    Top-level processor module. Instantiates both caches and memory, wires
+    them to the pipeline, and handles cache miss stall signals.
+
+  phase6/EX_MEM.v
+    Execute/Memory pipeline register (from Phase 5, unchanged).
+
+  phase6/MEM_WB.v
+    Memory/Writeback pipeline register (from Phase 5, unchanged).
+
+  TEST INFRASTRUCTURE
+  -------------------
+  phase6/CACHE_TB.v
+    Verilog testbench. Reads an input trace file, drives the cache, and
+    writes a cycle-by-cycle output log for comparison.
+
+  phase6/run_tests.py
+    Python test runner. Loops over all 8 trace configurations, runs the
+    testbench for each, diffs output vs. expected, reports pass/fail.
+
+  SUPPORT FILES
+  -------------
+  phase6/signals.yaml
+    Signal mapping file for the autograder. Updated to include
+    Instruction_Cache and Data_Cache entries.
+
+  phase5/assembler.py
+    RISC-V assembler. Updated with --output_dir flag and auto-EBREAK.
+
+  DOCUMENTATION
+  -------------
+  phase6/TA_TRACE_BUGS.md
+    Detailed technical proof (cycle-by-cycle trace analysis) for all 3
+    TA output trace bugs. Includes brute-force verification for Bug 3.
+
+  phase6/PROJECT_SUMMARY.txt
+    This file.
+
+
+--------------------------------------------------------------------------------
+  IMPORTANT NOTES FOR YOUR PARTNER
+--------------------------------------------------------------------------------
+
+1. CACHE_SIZE is in BYTES, not kilobytes.
+   The parameter name and the TA trace file names both use raw byte counts.
+   Example: "size1024" means 1024 bytes, not 1 KB (though in this case it
+   happens to be the same). This was verified against all 5 passing tests.
+
+2. All cache parameters are in one place.
+   The top of CACHE.v has parameter declarations. Changing the cache
+   configuration for testing only requires editing those values.
+
+3. If the TA fixes the buggy traces, re-running run_tests.py should hit 8/8.
+   Our implementation is correct. The 3 failures are solely due to bad
+   expected outputs in the TA's trace files.
+
+4. Pipeline integration is complete.
+   RISCV_TOP.v is fully wired: both caches, main memory, and stall logic are
+   in place. A cache miss stalls the entire pipeline until the data arrives.
+
+5. The PLRU implementation uses a bit-tree (log2(WAYS) bits per set).
+   This is standard hardware PLRU. On each access, the bits along the path
+   from root to the accessed way are flipped to point away from that way,
+   guiding the next eviction toward the least recently used side.
+
+================================================================================
+  END OF SUMMARY
+================================================================================
