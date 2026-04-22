@@ -1,6 +1,6 @@
 module ALU_CONTROL (
     input [2:0] iAluOp,
-    input [2:0] iFunct3,
+    input [2:0] i_funct,
     input [6:0] iFunct7,
     output [3:0] oAluCtrl
 );
@@ -33,7 +33,7 @@ module ALU_CONTROL (
 
             // Branch: decode funct3
             3'b001: begin
-                case (iFunct3)
+                case (i_funct)
                     3'b000: aluCtrl = BEQ;
                     3'b001: aluCtrl = BNE;
                     3'b100: aluCtrl = BLT;
@@ -46,7 +46,7 @@ module ALU_CONTROL (
 
             // R-type: decode funct3 + funct7
             3'b010: begin
-                case (iFunct3)
+                case (i_funct)
                     3'b000: aluCtrl = (iFunct7[5]) ? SUB : ADD;
                     3'b001: aluCtrl = SLL;
                     3'b010: aluCtrl = SLT;
@@ -61,7 +61,7 @@ module ALU_CONTROL (
 
             // I-type arithmetic: decode funct3
             3'b011: begin
-                case (iFunct3)
+                case (i_funct)
                     3'b000: aluCtrl = ADD;   // ADDI
                     3'b001: aluCtrl = SLL;   // SLLI
                     3'b010: aluCtrl = SLT;   // SLTI

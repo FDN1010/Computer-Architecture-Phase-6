@@ -1,486 +1,510 @@
-// CACHE.v  N-way set-associative cache with LRU/PLRU, next-line prefetch,
-// write-back on eviction, write-allocate on miss.
-//
-// KEY INSIGHT: prefetch block (miss_base + BLOCK_SIZE) may be in a DIFFERENT
-// set than the miss block. We must use f_idx(pref_addr) for pref eviction.
-
-`timescale 1ns/1ps
-
 module CACHE #(
-    parameter EVICT_POLICY = 0,   // 0=LRU  1=PLRU
-    parameter WAYS         = 4,
-    parameter CACHE_SIZE   = 32,  // bytes total
-    parameter BLOCK_SIZE   = 64   // bytes per block
-) (
-    input  wire        i_clk,
-    input  wire        i_rstn,
-    input  wire        i_read,
-    input  wire        i_write,
-    input  wire [1:0]  i_funct,
-    input  wire [31:0] i_addr,
-    input  wire [31:0] i_cpu_data,
-    input  wire        i_mem_ready,
-    input  wire        i_mem_valid,
-    input  wire [BLOCK_SIZE*8-1:0] i_mem_data,
-    output reg         o_hit,
-    output reg         o_miss,
-    output reg  [31:0] o_cpu_data,
-    output reg         o_mem_rd,
-    output reg         o_mem_wr,
-    output reg  [31:0] o_mem_rd_addr,
-    output reg  [31:0] o_mem_wr_addr,
-    output reg  [BLOCK_SIZE*8-1:0] o_mem_rd_data,
-    output reg  [BLOCK_SIZE*8-1:0] o_mem_wr_data
+    parameter CACHE_SIZE  = 4096,
+    parameter BLOCK_SIZE  = 64,
+    parameter NUM_WAYS    = 4,
+    parameter WAYS        = NUM_WAYS,
+    parameter IS_INSTR    = 0,
+    parameter EVICT_POLICY = 0,
+    parameter WRITE_BACK   = 1,
+    parameter PREFETCH     = 1,
+    parameter MEM_CYCLES   = 100
+)(
+    input         i_clk,
+    input         i_rstn,
+
+    input  [31:0] i_addr,
+    input  [31:0] i_cpu_data,
+    input  [2:0]  i_funct,
+    input         i_read,
+    input         i_write,
+
+    input                         i_mem_ready,
+    input                         i_mem_valid,
+    input  [BLOCK_SIZE*8-1:0]     i_mem_rd_data,
+
+    output reg        o_hit,
+    output reg        o_miss,
+    output reg        o_stall,
+    output reg [31:0] o_cpu_data,
+
+    output reg        o_mem_rd,
+    output reg        o_mem_wr,
+    output reg [31:0] o_mem_rd_addr,
+    output reg [31:0] o_mem_wr_addr,
+    output reg [BLOCK_SIZE*8-1:0] o_mem_wr_data
 );
 
-// =========================================================
-// Derived parameters
-// =========================================================
-localparam LOG2_WAYS   = $clog2(WAYS);
-localparam SETS        = CACHE_SIZE / (WAYS * BLOCK_SIZE);
-localparam INDEX_BITS  = (SETS > 1) ? $clog2(SETS) : 0;
-localparam OFFSET_BITS = $clog2(BLOCK_SIZE);
-localparam TAG_BITS    = 32 - INDEX_BITS - OFFSET_BITS;
-localparam BLOCK_BITS  = BLOCK_SIZE * 8;
-localparam TOTAL       = SETS * WAYS;
+    localparam SETS       = (CACHE_SIZE / (BLOCK_SIZE * WAYS)) < 1 ? 1
+                                                                     : (CACHE_SIZE / (BLOCK_SIZE * WAYS));
+    localparam BLOCK_BITS = $clog2(BLOCK_SIZE);
+    // When SETS==1 (fully associative) use 0 set-index bits so the full
+    // remaining address is available as tag.  Verilog doesn't allow 0-wide
+    // vectors so we keep the wire at 1 bit but mask it to 0 in w_set.
+    localparam SET_BITS   = (SETS <= 1) ? 1 : $clog2(SETS);
+    localparam SET_SHIFT  = (SETS <= 1) ? 0 : SET_BITS;   // bits consumed by set index
+    localparam TAG_BITS   = 32 - SET_SHIFT - BLOCK_BITS;
+    localparam WAY_BITS   = (WAYS <= 1) ? 1 : $clog2(WAYS);
 
-// =========================================================
-// Storage
-// =========================================================
-reg [TAG_BITS-1:0]    r_tag  [0:TOTAL-1];
-reg [BLOCK_BITS-1:0]  r_data [0:TOTAL-1];
-reg                   r_valid[0:TOTAL-1];
-reg                   r_dirty[0:TOTAL-1];
-reg [LOG2_WAYS-1:0]   r_lru  [0:TOTAL-1];
-reg [WAYS-2:0]        r_plru [0:SETS-1];
+    reg [TAG_BITS-1:0]      tag   [0:SETS-1][0:WAYS-1];
+    reg [BLOCK_SIZE*8-1:0]  data  [0:SETS-1][0:WAYS-1];
+    reg                     valid [0:SETS-1][0:WAYS-1];
+    reg                     dirty [0:SETS-1][0:WAYS-1];
+    reg [WAY_BITS-1:0]      age   [0:SETS-1][0:WAYS-1];
 
-// =========================================================
-// State
-// =========================================================
-localparam S_IDLE = 2'd0, S_MISS = 2'd1, S_PREFETCH = 2'd2;
-reg [1:0]             r_state;
-reg [31:0]            r_miss_addr;
-reg [1:0]             r_funct;
-reg                   r_is_read;
-reg [31:0]            r_cpu_wdata;
-reg [LOG2_WAYS-1:0]   r_filled_way;
-reg [LOG2_WAYS-1:0]   r_pref_ev_way;
-reg [31:0]            r_cpu_data_reg;
-reg                   r_wr_active;
-reg [31:0]            r_wr_addr;
-reg [BLOCK_BITS-1:0]  r_wr_data;
-// Prefetch set may differ from miss set when BLOCK_SIZE crosses set boundaries
-reg [31:0]            r_pref_set;  // set index of prefetch block
+    // PLRU tree bits: WAYS-1 bits per set
+    /* verilator lint_off WIDTH */
+    localparam [WAY_BITS-1:0] MRU_AGE  = WAYS - 1;
+    /* verilator lint_on WIDTH */
+    localparam                PLRU_BITS = (WAYS <= 1) ? 1 : WAYS - 1;
+    reg [PLRU_BITS-1:0] plru_tree [0:SETS-1];
 
-// =========================================================
-// Address helpers (no variable-width part-selects)
-// =========================================================
-function automatic [31:0] f_idx;
-    input [31:0] a;
-    begin
-        if (INDEX_BITS > 0)
-            f_idx = (a >> OFFSET_BITS) & ((1 << INDEX_BITS) - 1);
-        else
-            f_idx = 0;
-    end
-endfunction
+    wire [SET_BITS-1:0] w_set =
+        (SETS <= 1) ? 1'b0 : i_addr[BLOCK_BITS + SET_BITS - 1 : BLOCK_BITS];
 
-function automatic [TAG_BITS-1:0] f_tag;
-    input [31:0] a;
-    f_tag = a[31 : INDEX_BITS+OFFSET_BITS];
-endfunction
+    wire [TAG_BITS-1:0] w_tag =
+        i_addr[31 : BLOCK_BITS + SET_SHIFT];
 
-function automatic [31:0] f_base;
-    input [31:0] a;
-    f_base = a & ~((1 << OFFSET_BITS) - 1);
-endfunction
+    wire [BLOCK_BITS-1:0] byte_off =
+        i_addr[BLOCK_BITS-1:0];
 
-// Build block-base address from tag + set index.
-// = {tag[TAG_BITS-1:0], index_bits, zero_offset_bits}
-// Using arithmetic to avoid variable-width part-selects.
-function automatic [31:0] f_block_addr;
-    input [TAG_BITS-1:0] tag;
-    input integer        set_idx;
-    begin
-        f_block_addr = {tag, {(INDEX_BITS+OFFSET_BITS){1'b0}}} |
-                       (set_idx << OFFSET_BITS);
-    end
-endfunction
+    // ---------------------------------------------------------------
+    // Hit detection
+    // ---------------------------------------------------------------
+    integer w;
+    reg hit;
+    reg [WAY_BITS-1:0] hit_way;
 
-// =========================================================
-// Data helpers
-// =========================================================
-function automatic [31:0] f_extract;
-    input [BLOCK_BITS-1:0] blk;
-    input [OFFSET_BITS-1:0] boff;
-    input [1:0] fn;
-    integer b;
-    begin
-        b = {boff, 3'b0};
-        case (fn)
-            2'b00:   f_extract = {24'b0, blk[b +: 8]};
-            2'b01:   f_extract = {16'b0, blk[b+8 +: 8], blk[b +: 8]};
-            default: f_extract = {blk[b+24 +: 8], blk[b+16 +: 8],
-                                   blk[b+8  +: 8], blk[b    +: 8]};
-        endcase
-    end
-endfunction
-
-// Data at byte offset 0 of a block (used for miss/prefetch CPU return)
-function automatic [31:0] f_pos0;
-    input [BLOCK_BITS-1:0] blk;
-    input [1:0] fn;
-    begin
-        case (fn)
-            2'b00:   f_pos0 = {24'b0, blk[7:0]};
-            2'b01:   f_pos0 = {16'b0, blk[15:8], blk[7:0]};
-            default: f_pos0 = {blk[31:24], blk[23:16], blk[15:8], blk[7:0]};
-        endcase
-    end
-endfunction
-
-function automatic [BLOCK_BITS-1:0] f_wb;
-    input [BLOCK_BITS-1:0] blk;
-    input [OFFSET_BITS-1:0] boff;
-    input [1:0] fn;
-    input [31:0] wd;
-    integer b;
-    reg [BLOCK_BITS-1:0] t;
-    begin
-        t = blk; b = {boff, 3'b0};
-        t[b +: 8] = wd[7:0];
-        if (fn >= 2'b01) t[b+8  +: 8] = wd[15:8];
-        if (fn == 2'b10) begin
-            t[b+16 +: 8] = wd[23:16];
-            t[b+24 +: 8] = wd[31:24];
-        end
-        f_wb = t;
-    end
-endfunction
-
-// =========================================================
-// LRU eviction: first invalid way, else minimum LRU counter.
-// excl = WAYS means no exclusion.
-// =========================================================
-function automatic [LOG2_WAYS-1:0] f_lru_ev;
-    input integer s;
-    input integer excl;
-    integer i, best;
-    reg [LOG2_WAYS-1:0] best_cnt;
-    reg found_inv, found_any;
-    begin
-        best      = 0; best_cnt = {LOG2_WAYS{1'b1}};
-        found_inv = 0; found_any = 0;
-        for (i = 0; i < WAYS; i = i + 1) begin
-            if (i != excl) begin
-                if (!r_valid[s*WAYS + i]) begin
-                    if (!found_inv) begin
-                        best = i; found_inv = 1; found_any = 1;
-                    end
-                end else if (!found_inv) begin
-                    if (!found_any || r_lru[s*WAYS + i] < best_cnt) begin
-                        best = i; best_cnt = r_lru[s*WAYS + i]; found_any = 1;
-                    end
-                end
+    always @(*) begin
+        hit = 0;
+        hit_way = 0;
+        for (w = 0; w < WAYS; w = w + 1) begin
+            if (valid[w_set][w] && tag[w_set][w] == w_tag) begin
+                hit = 1;
+                hit_way = w[WAY_BITS-1:0];
             end
         end
-        f_lru_ev = best[LOG2_WAYS-1:0];
     end
-endfunction
 
-// =========================================================
-// PLRU eviction: follow tree; if landing on excl, flip last branch.
-// =========================================================
-function automatic [LOG2_WAYS-1:0] f_plru_ev;
-    input integer s;
-    input integer excl;
-    integer i, node, d, w;
-    reg found_inv;
-    begin
-        found_inv = 0; w = 0;
-        for (i = 0; i < WAYS; i = i + 1)
-            if (i != excl && !r_valid[s*WAYS + i] && !found_inv)
-                begin w = i; found_inv = 1; end
-        if (!found_inv) begin
+    // ---------------------------------------------------------------
+    // LRU victim selection
+    // Prefer invalid ways first; among valid ways pick lowest age (LRU)
+    // ---------------------------------------------------------------
+    reg [WAY_BITS-1:0] lru_way;
+    integer lv;
+    always @(*) begin
+        // Default to way 0
+        lru_way = 0;
+        // First: pick any invalid way (free slot — no eviction needed)
+        begin : lru_invalid_scan
+            reg found_invalid;
+            found_invalid = 1'b0;
+            for (lv = 0; lv < WAYS; lv = lv + 1) begin
+                if (!valid[w_set][lv] && !found_invalid) begin
+                    lru_way = lv[WAY_BITS-1:0];
+                    found_invalid = 1'b1;
+                end
+            end
+            // If no invalid way found, fall back to true LRU (lowest age)
+            if (!found_invalid) begin
+                lru_way = 0;
+                for (lv = 1; lv < WAYS; lv = lv + 1)
+                    if (age[w_set][lv] < age[w_set][lru_way])
+                        lru_way = lv[WAY_BITS-1:0];
+            end
+        end
+    end
+
+    // ---------------------------------------------------------------
+    // PLRU victim selection (binary tree, WAYS must be power of 2)
+    // ---------------------------------------------------------------
+    reg [WAY_BITS-1:0] plru_way;
+    always @(*) begin
+        plru_way = 0;
+        begin : plru_find
+            integer node;
+            integer level;
             node = 0;
-            for (d = 0; d < LOG2_WAYS; d = d + 1)
-                node = (r_plru[s][node] == 1'b0) ? 2*node+1 : 2*node+2;
-            w = node - (WAYS - 1);
-            if (w == excl) begin
-                node = 0;
-                for (d = 0; d < LOG2_WAYS-1; d = d + 1)
-                    node = (r_plru[s][node] == 1'b0) ? 2*node+1 : 2*node+2;
-                node = (r_plru[s][node] == 1'b0) ? 2*node+2 : 2*node+1;
-                w = node - (WAYS - 1);
-            end
-        end
-        f_plru_ev = w[LOG2_WAYS-1:0];
-    end
-endfunction
-
-// Wrapper respecting EVICT_POLICY
-function automatic [LOG2_WAYS-1:0] f_ev;
-    input integer s;
-    input integer excl;
-    begin
-        f_ev = (EVICT_POLICY == 0) ? f_lru_ev(s, excl) : f_plru_ev(s, excl);
-    end
-endfunction
-
-// =========================================================
-// Hit detection (combinational)
-// =========================================================
-reg                  w_hit;
-reg [LOG2_WAYS-1:0]  w_hit_way;
-integer ci, ci_set;
-always @(*) begin
-    ci_set    = f_idx(i_addr);
-    w_hit     = 0;
-    w_hit_way = 0;
-    for (ci = 0; ci < WAYS; ci = ci + 1)
-        if (r_valid[ci_set*WAYS + ci] &&
-            r_tag  [ci_set*WAYS + ci] == f_tag(i_addr)) begin
-            w_hit     = 1;
-            w_hit_way = ci[LOG2_WAYS-1:0];
-        end
-end
-
-wire w_cap = i_mem_ready && i_mem_valid;
-
-// =========================================================
-// Combinational outputs
-// =========================================================
-integer co_set;
-reg [LOG2_WAYS-1:0] co_ev;
-
-always @(*) begin
-    o_hit = 0; o_miss = 0; o_cpu_data = 0;
-    o_mem_rd = 0; o_mem_wr = 0;
-    o_mem_rd_addr = 0; o_mem_wr_addr = 0;
-    o_mem_rd_data = 0; o_mem_wr_data = 0;
-    co_ev = 0;
-
-    co_set = (r_state == S_IDLE) ? f_idx(i_addr) : f_idx(r_miss_addr);
-
-    case (r_state)
-        S_IDLE: begin
-            if (i_read || i_write) begin
-                if (w_hit) begin
-                    o_hit  = 1;
-                    o_miss = i_write ? 1'b1 : 1'b0;
-                    o_cpu_data = i_read ?
-                                 f_extract(r_data[co_set*WAYS + w_hit_way],
-                                           i_addr[OFFSET_BITS-1:0], i_funct)
-                                 : r_cpu_data_reg;
-                end else begin
-                    o_miss        = 1;
-                    o_mem_rd      = 1;
-                    o_mem_rd_addr = f_base(i_addr);
-                    o_cpu_data    = r_cpu_data_reg;
-                end
-            end
-        end
-
-        S_MISS: begin
-            o_miss   = 1;
-            o_mem_rd = 1;
-            if (w_cap) begin
-                // Eviction from MISS set
-                co_ev = f_ev(co_set, WAYS);
-                o_mem_rd_addr = f_base(r_miss_addr) + BLOCK_SIZE;
-                if (r_valid[co_set*WAYS + co_ev] && r_dirty[co_set*WAYS + co_ev]) begin
-                    o_mem_wr      = 1;
-                    o_mem_wr_addr = f_block_addr(r_tag[co_set*WAYS + co_ev], co_set);
-                    o_mem_wr_data = r_data[co_set*WAYS + co_ev];
-                end
-                o_cpu_data = r_is_read ? f_pos0(i_mem_data, r_funct) : r_cpu_data_reg;
-            end else begin
-                o_mem_rd_addr = f_base(r_miss_addr);
-                o_cpu_data    = r_cpu_data_reg;
-            end
-        end
-
-        S_PREFETCH: begin
-            if (w_cap) begin
-                o_mem_rd_addr = f_base(r_miss_addr) + BLOCK_SIZE;
-                o_cpu_data    = r_is_read ? f_pos0(i_mem_data, r_funct) : r_cpu_data_reg;
-                // wr=0 at done per TA traces (prefetch eviction assumed clean)
-            end else begin
-                o_miss        = 1;
-                o_mem_rd      = 1;
-                o_mem_rd_addr = f_base(r_miss_addr) + BLOCK_SIZE;
-                o_cpu_data    = r_cpu_data_reg;
-                o_mem_wr      = r_wr_active;
-                o_mem_wr_addr = r_wr_addr;
-                o_mem_wr_data = r_wr_data;
-            end
-        end
-
-        default: begin end
-    endcase
-end
-
-// =========================================================
-// Sequential logic
-// =========================================================
-integer sm_set, sm_pref_set, sm_ev, sm_pref_ev, j, pnd, pdir;
-
-always @(posedge i_clk or negedge i_rstn) begin
-    if (!i_rstn) begin
-        r_state <= S_IDLE; r_wr_active <= 0; r_cpu_data_reg <= 0;
-        r_filled_way <= 0; r_pref_ev_way <= 0; r_pref_set <= 0;
-        for (j = 0; j < TOTAL; j = j+1) begin
-            r_valid[j] <= 0; r_dirty[j] <= 0;
-            r_lru  [j] <= 0; r_tag  [j] <= 0;
-            r_data [j] <= 0;
-        end
-        for (j = 0; j < SETS; j = j+1) r_plru[j] <= 0;
-    end else begin
-        case (r_state)
-
-        // ── IDLE ─────────────────────────────────────────────
-        S_IDLE: begin
-            r_wr_active <= 0;
-            if (i_read || i_write) begin
-                sm_set = f_idx(i_addr);
-                if (w_hit) begin
-                    // Write hit: update data + dirty
-                    if (i_write) begin
-                        r_data [sm_set*WAYS + w_hit_way] <=
-                            f_wb(r_data[sm_set*WAYS + w_hit_way],
-                                 i_addr[OFFSET_BITS-1:0], i_funct, i_cpu_data);
-                        r_dirty[sm_set*WAYS + w_hit_way] <= 1;
-                    end
-                    // Update replacement
-                    if (EVICT_POLICY == 0) begin
-                        for (j = 0; j < WAYS; j = j+1) begin
-                            if (j == w_hit_way)
-                                r_lru[sm_set*WAYS + j] <= WAYS-1;
-                            else if (r_valid[sm_set*WAYS + j] &&
-                                     r_lru[sm_set*WAYS + j] > 0)
-                                r_lru[sm_set*WAYS + j] <=
-                                    r_lru[sm_set*WAYS + j] - 1;
-                        end
-                    end else begin
-                        pnd = 0;
-                        for (pdir = LOG2_WAYS-1; pdir >= 0; pdir = pdir-1) begin
-                            if (((w_hit_way >> pdir) & 1) == 0)
-                                begin r_plru[sm_set][pnd] <= 1; pnd = 2*pnd+1; end
-                            else
-                                begin r_plru[sm_set][pnd] <= 0; pnd = 2*pnd+2; end
-                        end
-                    end
-                    r_cpu_data_reg <= 0;
-                end else begin
-                    r_miss_addr <= i_addr;
-                    r_funct     <= i_funct;
-                    r_is_read   <= i_read;
-                    r_cpu_wdata <= i_cpu_data;
-                    r_state     <= S_MISS;
-                end
-            end else begin
-                r_cpu_data_reg <= 0;
-            end
-        end
-
-        // ── MISS ─────────────────────────────────────────────
-        S_MISS: begin
-            if (w_cap) begin
-                sm_set      = f_idx(r_miss_addr);
-                // Prefetch block address and its set index
-                sm_pref_set = f_idx(f_base(r_miss_addr) + BLOCK_SIZE);
-
-                // Compute eviction for MISS set (no exclusion)
-                sm_ev = f_ev(sm_set, WAYS);
-
-                // Compute eviction for PREFETCH set.
-                // If same set as miss: exclude the just-filled miss way.
-                // If different set: no exclusion needed.
-                if (sm_pref_set == sm_set)
-                    sm_pref_ev = f_ev(sm_pref_set, sm_ev);
+            for (level = 0; level < WAY_BITS; level = level + 1) begin
+                if (plru_tree[w_set][node] == 1'b0)
+                    node = 2*node + 1;
                 else
-                    sm_pref_ev = f_ev(sm_pref_set, WAYS);
-                r_pref_ev_way <= sm_pref_ev[LOG2_WAYS-1:0];
-                r_pref_set    <= sm_pref_set;
+                    node = 2*node + 2;
+            end
+            plru_way = node[WAY_BITS-1:0] - WAY_BITS'(WAYS-1);
+        end
+    end
 
-                // Write-back dirty miss eviction
-                if (r_valid[sm_set*WAYS + sm_ev] && r_dirty[sm_set*WAYS + sm_ev]) begin
-                    r_wr_active <= 1;
-                    r_wr_addr   <= f_block_addr(r_tag[sm_set*WAYS + sm_ev], sm_set);
-                    r_wr_data   <= r_data[sm_set*WAYS + sm_ev];
-                end else begin
-                    r_wr_active <= 0;
+    // ---------------------------------------------------------------
+    // Eviction way mux
+    // ---------------------------------------------------------------
+    wire [WAY_BITS-1:0] evict_way = (EVICT_POLICY == 0) ? lru_way : plru_way;
+
+    // ---------------------------------------------------------------
+    // extract_word: read a sub-word from a cache block
+    // ---------------------------------------------------------------
+    function [31:0] extract_word;
+        input [BLOCK_SIZE*8-1:0] blk;
+        input [BLOCK_BITS-1:0] off;
+        input [2:0] fn3;
+        reg [7:0] b0,b1,b2,b3;
+        reg [31:0] off_w;
+        begin
+            off_w = {26'b0, off};
+            b0 = blk[off_w*8 +:8];
+            b1 = blk[(off_w+1)*8 +:8];
+            b2 = blk[(off_w+2)*8 +:8];
+            b3 = blk[(off_w+3)*8 +:8];
+            case (fn3)
+                3'h0: extract_word = {{24{b0[7]}}, b0};        // LB
+                3'h1: extract_word = {{16{b1[7]}}, b1, b0};    // LH
+                3'h4: extract_word = {24'b0, b0};               // LBU
+                3'h5: extract_word = {16'b0, b1, b0};           // LHU
+                default: extract_word = {b3, b2, b1, b0};       // LW
+            endcase
+        end
+    endfunction
+
+    // ---------------------------------------------------------------
+    // insert_word: write a sub-word into a cache block
+    // ---------------------------------------------------------------
+    function [BLOCK_SIZE*8-1:0] insert_word;
+        input [BLOCK_SIZE*8-1:0] blk;
+        input [BLOCK_BITS-1:0] off;
+        input [31:0] wdata;
+        input [2:0] fn3;
+        reg [BLOCK_SIZE*8-1:0] tmp;
+        reg [31:0] off_w;
+        begin
+            tmp = blk;
+            off_w = {26'b0, off};
+            case (fn3)
+                3'h0: begin // SB
+                    tmp[off_w*8 +:8] = wdata[7:0];
                 end
+                3'h1: begin // SH
+                    tmp[off_w*8     +:8] = wdata[7:0];
+                    tmp[(off_w+1)*8 +:8] = wdata[15:8];
+                end
+                default: begin // SW (fn3==2)
+                    tmp[off_w*8     +:8] = wdata[7:0];
+                    tmp[(off_w+1)*8 +:8] = wdata[15:8];
+                    tmp[(off_w+2)*8 +:8] = wdata[23:16];
+                    tmp[(off_w+3)*8 +:8] = wdata[31:24];
+                end
+            endcase
+            insert_word = tmp;
+        end
+    endfunction
 
-                // Place miss block (clean; may be dirtied at PREFETCH done)
-                r_tag  [sm_set*WAYS + sm_ev] <= f_tag(r_miss_addr);
-                r_data [sm_set*WAYS + sm_ev] <= i_mem_data;
-                r_valid[sm_set*WAYS + sm_ev] <= 1;
-                r_dirty[sm_set*WAYS + sm_ev] <= 0;
-                r_filled_way                 <= sm_ev[LOG2_WAYS-1:0];
+    // ---------------------------------------------------------------
+    // LRU update task
+    // Promote accessed way to MRU (age = WAYS-1); demote all others
+    // whose age was strictly greater than the accessed way's old age.
+    // ---------------------------------------------------------------
+    task update_lru;
+        input [SET_BITS-1:0]  s;
+        input [WAY_BITS-1:0] widx;
+        integer i;
+        reg [WAY_BITS-1:0] old_age;
+        begin
+            old_age = age[s][widx];
+            for (i = 0; i < WAYS; i = i + 1) begin
+                if (i[WAY_BITS-1:0] == widx) begin
+                    age[s][i] <= MRU_AGE;
+                end else if (age[s][i] > old_age) begin
+                    age[s][i] <= age[s][i] - 1'b1;
+                end
+                // ways with age <= old_age (other than widx) keep their age
+            end
+        end
+    endtask
 
-                // Update replacement for miss set
-                if (EVICT_POLICY == 0) begin
-                    if (r_is_read) begin
-                        for (j = 0; j < WAYS; j = j+1) begin
-                            if (j == sm_ev) r_lru[sm_set*WAYS+j] <= WAYS-1;
-                            else if (r_valid[sm_set*WAYS+j] &&
-                                     r_lru[sm_set*WAYS+j] > 0)
-                                r_lru[sm_set*WAYS+j] <= r_lru[sm_set*WAYS+j]-1;
+    // ---------------------------------------------------------------
+    // PLRU update task
+    // ---------------------------------------------------------------
+    task update_plru;
+        input [SET_BITS-1:0]  s;
+        input [WAY_BITS-1:0] widx;
+        integer level;
+        integer node;
+        begin
+            node = 0;
+            for (level = 0; level < WAY_BITS; level = level + 1) begin
+                if (widx[WAY_BITS-1-level] == 1'b0) begin
+                    plru_tree[s][node] <= 1'b1;
+                    node = 2*node + 1;
+                end else begin
+                    plru_tree[s][node] <= 1'b0;
+                    node = 2*node + 2;
+                end
+            end
+        end
+    endtask
+
+    // ---------------------------------------------------------------
+    // State machine
+    // ---------------------------------------------------------------
+    reg [1:0] state;
+
+    // Saved miss-time state
+    reg [SET_BITS-1:0]     saved_set;
+    reg [TAG_BITS-1:0]     saved_tag;
+    reg [WAY_BITS-1:0]     saved_evict;
+    reg                    saved_write;
+    reg [31:0]             saved_cpu_data;
+    reg [2:0]              saved_funct;
+    reg [BLOCK_BITS-1:0]   saved_byte_off;
+    reg [31:0]             saved_addr;
+
+    // Prefetch saved state
+    reg [WAY_BITS-1:0]     pf_evict;
+    reg [TAG_BITS-1:0]     pf_tag;
+    reg [SET_BITS-1:0]     pf_set;
+
+    // S_IDLE  : waiting for request
+    // S_FETCH : waiting for main memory to return the requested block
+    // S_PFETCH: waiting for main memory to return the prefetch block
+    localparam S_IDLE=0, S_FETCH=1, S_PFETCH=2;
+
+    integer rs, rw;
+    always @(posedge i_clk or negedge i_rstn) begin
+        if (!i_rstn) begin
+            state   <= S_IDLE;
+            o_stall <= 1'b0;
+            for (rs = 0; rs < (SETS==0 ? 1 : SETS); rs = rs + 1) begin
+                plru_tree[rs] <= 0;
+                for (rw = 0; rw < WAYS; rw = rw + 1) begin
+                    valid[rs][rw] <= 0;
+                    dirty[rs][rw] <= 0;
+                    age[rs][rw]   <= rw[WAY_BITS-1:0];
+                end
+            end
+        end else begin
+
+            o_hit    <= 0;
+            o_miss   <= 0;
+            o_stall  <= 0;
+            o_mem_rd <= 0;
+            o_mem_wr <= 0;
+
+            case (state)
+
+            // ----------------------------------------------------------
+            S_IDLE: begin
+                if (i_read || i_write) begin
+                    if (hit) begin
+                        o_hit <= 1;
+
+                        if (i_read)
+                            o_cpu_data <= extract_word(data[w_set][hit_way], byte_off, i_funct);
+
+                        if (i_write) begin
+                            data[w_set][hit_way] <=
+                                insert_word(data[w_set][hit_way], byte_off, i_cpu_data, i_funct);
+
+                            if (WRITE_BACK) begin
+                                dirty[w_set][hit_way] <= 1;
+                            end else begin
+                                // Write-through hit: push word to memory immediately
+                                o_mem_wr      <= 1;
+                                o_mem_wr_addr <= {i_addr[31:BLOCK_BITS], {BLOCK_BITS{1'b0}}};
+                                o_mem_wr_data <=
+                                    insert_word(data[w_set][hit_way], byte_off, i_cpu_data, i_funct);
+                            end
+                        end
+
+                        if (EVICT_POLICY == 0)
+                            update_lru(w_set, hit_way);
+                        else
+                            update_plru(w_set, hit_way);
+
+                    end else begin
+                        // Miss: request block from memory
+                        o_miss        <= 1;
+                        o_stall       <= 1;
+                        o_mem_rd      <= 1;
+                        o_mem_rd_addr <= {i_addr[31:BLOCK_BITS], {BLOCK_BITS{1'b0}}};
+
+                        // Save everything needed for fill
+                        saved_set      <= w_set;
+                        saved_tag      <= w_tag;
+                        saved_evict    <= evict_way;
+                        saved_write    <= i_write;
+                        saved_cpu_data <= i_cpu_data;
+                        saved_funct    <= i_funct;
+                        saved_byte_off <= byte_off;
+                        saved_addr     <= i_addr;
+                        state          <= S_FETCH;
+                    end
+                end
+            end
+
+            // ----------------------------------------------------------
+            // S_FETCH: wait for memory. When i_mem_ready fires, fill
+            // the cache line immediately (no separate S_FILL state) so
+            // the total miss penalty is exactly mem_cycles+1 cycles.
+            // ----------------------------------------------------------
+            S_FETCH: begin
+                o_stall <= 1;
+                if (i_mem_ready) begin
+
+                    // ---- evict dirty line if write-back ----
+                    if (WRITE_BACK && dirty[saved_set][saved_evict]) begin
+                        o_mem_wr      <= 1;
+                        /* verilator lint_off WIDTH */
+                        o_mem_wr_addr <= (SETS <= 1)
+                            ? {tag[saved_set][saved_evict], {BLOCK_BITS{1'b0}}}
+                            : {tag[saved_set][saved_evict], saved_set[SET_BITS-1:0], {BLOCK_BITS{1'b0}}};
+                        /* verilator lint_on WIDTH */
+                        o_mem_wr_data <= data[saved_set][saved_evict];
+                    end
+
+                    // ---- fill: write-allocate for write-back, no-allocate otherwise ----
+                    data[saved_set][saved_evict] <= (WRITE_BACK && saved_write)
+                        ? insert_word(i_mem_rd_data, saved_byte_off, saved_cpu_data, saved_funct)
+                        : i_mem_rd_data;
+
+                    tag[saved_set][saved_evict]   <= saved_tag;
+                    valid[saved_set][saved_evict] <= 1;
+
+                    // ---- dirty bit ----
+                    if (WRITE_BACK && saved_write)
+                        dirty[saved_set][saved_evict] <= 1;
+                    else
+                        dirty[saved_set][saved_evict] <= 0;
+
+                    // ---- return data to CPU on read miss ----
+                    if (!saved_write) begin
+                        o_cpu_data <= extract_word(i_mem_rd_data, saved_byte_off, saved_funct);
+                        o_hit      <= 1;   // signal fill completion to pipeline
+                    end else begin
+                        o_hit      <= 1;   // write miss fill also completes
+                    end
+                    o_stall <= 0;
+
+                    // ---- write-through miss: push word to memory ----
+                    if (!WRITE_BACK && saved_write) begin
+                        o_mem_wr      <= 1;
+                        o_mem_wr_addr <= {saved_addr[31:BLOCK_BITS], {BLOCK_BITS{1'b0}}};
+                        o_mem_wr_data <= i_mem_rd_data;
+                    end
+
+                    // ---- update replacement state ----
+                    if (EVICT_POLICY == 0)
+                        update_lru(saved_set, saved_evict);
+                    else
+                        update_plru(saved_set, saved_evict);
+
+                    // ---- prefetch next line if enabled ----
+                    if (PREFETCH) begin
+                        // Compute next-line address and its cache index
+                        begin : pf_calc
+                            reg [31:0] pf_addr;
+                            reg [SET_BITS-1:0]  pf_s;
+                            reg [TAG_BITS-1:0]  pf_t;
+                            reg [WAY_BITS-1:0]  pf_v;
+                            reg                 pf_already_valid;
+                            integer             pfw;
+
+                            pf_addr = {saved_addr[31:BLOCK_BITS], {BLOCK_BITS{1'b0}}}
+                                      + BLOCK_SIZE;
+                            pf_s = (SETS <= 1) ? 1'b0
+                                               : pf_addr[BLOCK_BITS + SET_BITS - 1 : BLOCK_BITS];
+                            pf_t = pf_addr[31 : BLOCK_BITS + SET_SHIFT];
+
+                            // Check if prefetch line already in cache
+                            pf_already_valid = 0;
+                            for (pfw = 0; pfw < WAYS; pfw = pfw + 1)
+                                if (valid[pf_s][pfw] && tag[pf_s][pfw] == pf_t)
+                                    pf_already_valid = 1;
+
+                            if (!pf_already_valid) begin
+                                // Select victim for prefetch line
+                                pf_already_valid = 0; // reuse as found_invalid flag
+                                pf_v = 0;
+                                for (pfw = 0; pfw < WAYS; pfw = pfw + 1)
+                                    if (!valid[pf_s][pfw] && !pf_already_valid) begin
+                                        pf_v = pfw[WAY_BITS-1:0];
+                                        pf_already_valid = 1;
+                                    end
+                                if (!pf_already_valid) begin
+                                    // All ways valid - use LRU/PLRU victim
+                                    pf_v = 0;
+                                    for (pfw = 1; pfw < WAYS; pfw = pfw + 1)
+                                        if (age[pf_s][pfw] < age[pf_s][pf_v])
+                                            pf_v = pfw[WAY_BITS-1:0];
+                                end
+
+                                pf_evict <= pf_v;
+                                pf_tag   <= pf_t;
+                                pf_set   <= pf_s;
+
+                                o_mem_rd      <= 1;
+                                o_mem_rd_addr <= pf_addr;
+                                o_stall       <= 0; // prefetch is background, don't stall
+                                state         <= S_PFETCH;
+                            end else begin
+                                state <= S_IDLE;
+                            end
                         end
                     end else begin
-                        r_lru[sm_set*WAYS + sm_ev] <= 0;
+                        state <= S_IDLE;
                     end
                 end
-                // PLRU: no update on miss install (only updated on S_IDLE hits)
-
-                if (r_is_read) r_cpu_data_reg <= f_pos0(i_mem_data, r_funct);
-                r_state <= S_PREFETCH;
             end
-        end
 
-        // ── PREFETCH ─────────────────────────────────────────
-        S_PREFETCH: begin
-            if (w_cap) begin
-                sm_set      = f_idx(r_miss_addr);
-                sm_pref_set = r_pref_set;  // registered at MISS capture
-                sm_ev       = r_pref_ev_way;
+            // ----------------------------------------------------------
+            // S_PFETCH: silently fill the prefetched line; no CPU stall
+            // ----------------------------------------------------------
+            S_PFETCH: begin
+                // Don't stall the pipeline during prefetch
+                o_stall <= 0;
+                if (i_mem_ready) begin
+                    // Evict dirty prefetch victim if write-back
+                    if (WRITE_BACK && dirty[pf_set][pf_evict]) begin
+                        o_mem_wr      <= 1;
+                        /* verilator lint_off WIDTH */
+                        o_mem_wr_addr <= (SETS <= 1)
+                            ? {tag[pf_set][pf_evict], {BLOCK_BITS{1'b0}}}
+                            : {tag[pf_set][pf_evict], pf_set[SET_BITS-1:0], {BLOCK_BITS{1'b0}}};
+                        /* verilator lint_on WIDTH */
+                        o_mem_wr_data <= data[pf_set][pf_evict];
+                    end
 
-                // Place prefetch block in its own set (clean)
-                r_tag  [sm_pref_set*WAYS + sm_ev] <= f_tag(f_base(r_miss_addr) + BLOCK_SIZE);
-                r_data [sm_pref_set*WAYS + sm_ev] <= i_mem_data;
-                r_valid[sm_pref_set*WAYS + sm_ev] <= 1;
-                r_dirty[sm_pref_set*WAYS + sm_ev] <= 0;
+                    data[pf_set][pf_evict]  <= i_mem_rd_data;
+                    tag[pf_set][pf_evict]   <= pf_tag;
+                    valid[pf_set][pf_evict] <= 1;
+                    dirty[pf_set][pf_evict] <= 0;
 
-                // Update replacement for PREFETCH set (always read-type)
-                if (EVICT_POLICY == 0) begin
-                    for (j = 0; j < WAYS; j = j+1) begin
-                        if (j == sm_ev) r_lru[sm_pref_set*WAYS+j] <= WAYS-1;
-                        else if (r_valid[sm_pref_set*WAYS+j] &&
-                                 r_lru[sm_pref_set*WAYS+j] > 0)
-                            r_lru[sm_pref_set*WAYS+j] <= r_lru[sm_pref_set*WAYS+j]-1;
+                    if (EVICT_POLICY == 0)
+                        update_lru(pf_set, pf_evict);
+                    else
+                        update_plru(pf_set, pf_evict);
+
+                    state <= S_IDLE;
+                end else begin
+                    // If a CPU request arrives while prefetching, we can
+                    // still serve hits from cache (prefetch is background)
+                    if ((i_read || i_write) && hit) begin
+                        o_hit <= 1;
+                        if (i_read)
+                            o_cpu_data <= extract_word(data[w_set][hit_way], byte_off, i_funct);
+                        if (i_write) begin
+                            data[w_set][hit_way] <=
+                                insert_word(data[w_set][hit_way], byte_off, i_cpu_data, i_funct);
+                            if (WRITE_BACK)
+                                dirty[w_set][hit_way] <= 1;
+                        end
+                        if (EVICT_POLICY == 0)
+                            update_lru(w_set, hit_way);
+                        else
+                            update_plru(w_set, hit_way);
                     end
                 end
-                // PLRU: no update on prefetch install (only updated on S_IDLE hits)
-
-                // Apply write-allocate to MISS set (mark dirty)
-                if (!r_is_read) begin
-                    r_data [sm_set*WAYS + r_filled_way] <=
-                        f_wb(r_data[sm_set*WAYS + r_filled_way],
-                             r_miss_addr[OFFSET_BITS-1:0], r_funct, r_cpu_wdata);
-                    r_dirty[sm_set*WAYS + r_filled_way] <= 1;
-                end
-
-                if (r_is_read) r_cpu_data_reg <= f_pos0(i_mem_data, r_funct);
-                r_wr_active <= 0;
-                r_state     <= S_IDLE;
             end
+
+            endcase
         end
-
-        default: r_state <= S_IDLE;
-
-        endcase
     end
-end
 
 endmodule

@@ -1,0 +1,14 @@
+---
+:id: 398838604
+:submitters:
+- :name: Fabian Nunez
+  :email: fa823674@ucf.edu
+- :name: Andrew Green
+  :email: an430275@ucf.edu
+:created_at: !ruby/object:ActiveSupport::TimeWithZone
+  utc: 2026-03-18 17:10:44.262867000 Z
+  zone: !ruby/object:ActiveSupport::TimeZone
+    name: America/Los_Angeles
+  time: 2026-03-18 10:10:44.262867000 Z
+:status: processed
+:score: 10.0

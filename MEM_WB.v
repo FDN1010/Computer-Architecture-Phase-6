@@ -1,11 +1,6 @@
-`timescale 1ns/1ps
-
-// MEM_WB.v  (Phase 6: adds iStall input for cache stall support)
-
 module MEM_WB (
-    input         iClk,
-    input         iRstN,
-    input         iStall,   // freeze register when 1
+    input         i_clk,
+    input         i_rstn,
 
     // WB
     input         iRegWrite,
@@ -31,12 +26,12 @@ module MEM_WB (
     output reg [31:0] oImm,
     output reg [4:0]  oRd
 );
-    always @(posedge iClk or negedge iRstN) begin
-        if (!iRstN) begin
+    always @(posedge i_clk or negedge i_rstn) begin
+        if (!i_rstn) begin
             oRegWrite    <= 0; oMemtoReg    <= 0; oJump <= 0; oLui <= 0;
             oAluResult   <= 0; oMemReadData <= 0; oPCPlus4 <= 0;
             oImm         <= 0; oRd          <= 0;
-        end else if (!iStall) begin
+        end else begin
             oRegWrite    <= iRegWrite;    oMemtoReg    <= iMemtoReg;
             oJump        <= iJump;        oLui         <= iLui;
             oAluResult   <= iAluResult;   oMemReadData <= iMemReadData;

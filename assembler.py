@@ -31,6 +31,12 @@ REG = {
 }
 
 # -------------------------------
+# Memory Map (Phase 6)
+# -------------------------------
+INSTR_BASE = 0x00400000   # .text section starts here
+DATA_BASE  = 0x10010000   # .data section starts here
+
+# -------------------------------
 # Global Tables
 # -------------------------------
 label_table = {}
@@ -47,8 +53,8 @@ def clean_line(line):
 # Pass 1: Build Label Table
 # -------------------------------
 def first_pass(lines):
-    pc = 0
-    data_pc = 0
+    pc = INSTR_BASE
+    data_pc = DATA_BASE
     in_text = False
     in_data = False
 
@@ -476,7 +482,7 @@ def encode_instruction(mnemonic, ops, pc):
 # Pass 2: Encode Instructions
 # -------------------------------
 def second_pass(lines, instr_path, data_path):
-    pc = 0
+    pc = INSTR_BASE
     in_text = False
 
     with open(instr_path, "w", newline='\n') as instr_out:

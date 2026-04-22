@@ -1,91 +1,137 @@
-`timescale 1ns/1ps
-
 // MAIN_MEMORY.v
-// Byte-addressable memory with configurable 100-cycle read latency.
-// Serves cache block reads and accepts cache write-back.
+// Unified main memory backing both instruction and data caches.
+// Byte-addressable. Initialised from instr.txt (instructions) and
+// data.txt (data) via $readmemh.
+//
+// Address map (matches Phase 6 spec):
+//   Instructions : 0x00400000 – 0x0FFFFFFF  (loaded from instr.txt)
+//   Init data    : 0x10010000 – 0x1003FFFF  (loaded from data.txt)
+//
+// The cache hands us a full 32-bit byte address.  We translate it to
+// an internal array index so both regions fit in a reasonably-sized
+// simulation array.
+//
+// Internal layout (flat byte array):
+//   [0          … INSTR_SIZE-1]  ← instruction region
+//   [INSTR_SIZE … INSTR_SIZE+DATA_SIZE-1] ← data region
+//
+// Block-level interface: the cache requests/returns BLOCK_SIZE bytes
+// at a time so we never have to loop outside this module.
 
 module MAIN_MEMORY #(
-    parameter BLOCK_SIZE = 64,         // bytes per block
-    parameter MEM_BYTES  = 1048576,    // total bytes
-    parameter BASE_ADDR  = 32'h00400000,
-    parameter INIT_FILE  = ""
-) (
-    input  wire        i_clk,
-    input  wire        i_rstn,
+    parameter BLOCK_SIZE  = 64,          // bytes per cache block
+    parameter INSTR_SIZE  = 65536,       // bytes reserved for instructions (64 KB)
+    parameter DATA_SIZE   = 196608       // bytes reserved for data        (192 KB)
+)(
+    input                        i_clk,
+    input                        i_rstn,
 
-    // Read port (from cache)
-    input  wire        i_rd,
-    input  wire [31:0] i_rd_addr,
-    output reg  [BLOCK_SIZE*8-1:0] o_rd_data,
-    output wire        o_ready,  // always 1
-    output reg         o_valid,
+    // Port A – instruction cache
+    input  [31:0]                iInstrAddr,      // byte address
+    input                        iInstrReq,       // cache is requesting a block
+    output reg [BLOCK_SIZE*8-1:0] oInstrBlock,    // block returned to i-cache
+    output reg                   oInstrReady,     // block is valid this cycle
 
-    // Write port (cache write-back eviction)
-    input  wire        i_wr,
-    input  wire [31:0] i_wr_addr,
-    input  wire [BLOCK_SIZE*8-1:0] i_wr_data
+    // Port B – data cache
+    input  [31:0]                iDataAddr,       // byte address
+    input                        iDataReq,        // cache requesting a block (read or write-back)
+    input                        iDataWrite,      // 1 = write block back to memory
+    input  [BLOCK_SIZE*8-1:0]    iDataBlock,      // block to write (write-back)
+    output reg [BLOCK_SIZE*8-1:0] oDataBlock,     // block returned to d-cache
+    output reg                   oDataReady       // block is valid this cycle
 );
 
-localparam PENALTY   = 100;
-localparam BLOCK_BITS = BLOCK_SIZE * 8;
+    // ----------------------------------------------------------------
+    // Internal byte arrays
+    // ----------------------------------------------------------------
+    reg [7:0] rInstrMem [0:INSTR_SIZE-1];
+    reg [7:0] rDataMem  [0:DATA_SIZE-1];
 
-reg [7:0] mem [0:MEM_BYTES-1];
-
-initial begin
-    if (INIT_FILE != "")
-        $readmemh(INIT_FILE, mem);
-end
-
-assign o_ready = 1'b1;
-
-// Write-back (immediate, no penalty)
-integer wi;
-always @(posedge i_clk) begin
-    if (i_wr) begin
-        for (wi = 0; wi < BLOCK_SIZE; wi = wi + 1) begin
-            if ((i_wr_addr - BASE_ADDR + wi) < MEM_BYTES)
-                mem[(i_wr_addr - BASE_ADDR + wi)] <= i_wr_data[wi*8 +: 8];
-        end
+    initial begin
+        $readmemh("instr.txt", rInstrMem);
+        $readmemh("data.txt",  rDataMem);
     end
-end
 
-// Read with PENALTY-cycle latency
-reg [7:0]  r_count;
-reg        r_busy;
-reg [31:0] r_held_addr;
-integer ri;
+    // ----------------------------------------------------------------
+    // Address translation helpers
+    // ----------------------------------------------------------------
+    localparam [31:0] INSTR_BASE = 32'h00400000;
+    localparam [31:0] DATA_BASE  = 32'h10010000;
 
-always @(posedge i_clk or negedge i_rstn) begin
-    if (!i_rstn) begin
-        r_count     <= 0;
-        r_busy      <= 0;
-        o_valid     <= 0;
-        r_held_addr <= 0;
-        o_rd_data   <= 0;
-    end else begin
-        if (!r_busy) begin
-            o_valid <= 0;
-            if (i_rd) begin
-                r_busy      <= 1;
-                r_count     <= PENALTY - 1;
-                r_held_addr <= i_rd_addr;
-            end
+    // Align address down to block boundary
+    function [31:0] block_base;
+        input [31:0] addr;
+        begin
+            block_base = addr & ~(BLOCK_SIZE - 1);
+        end
+    endfunction
+
+    // ----------------------------------------------------------------
+    // Instruction port – combinational read, 1-cycle registered output
+    // (the cache drives oInstrReady the cycle after it asserts iInstrReq)
+    // ----------------------------------------------------------------
+    integer ib;
+    always @(posedge i_clk or negedge i_rstn) begin
+        if (!i_rstn) begin
+            oInstrBlock <= 0;
+            oInstrReady <= 1'b0;
         end else begin
-            if (r_count == 0) begin
-                r_busy  <= 0;
-                o_valid <= 1;
-                for (ri = 0; ri < BLOCK_SIZE; ri = ri + 1) begin
-                    if ((r_held_addr - BASE_ADDR + ri) < MEM_BYTES)
-                        o_rd_data[ri*8 +: 8] <= mem[r_held_addr - BASE_ADDR + ri];
-                    else
-                        o_rd_data[ri*8 +: 8] <= 8'b0;
+            oInstrReady <= 1'b0;
+            if (iInstrReq) begin
+                // read BLOCK_SIZE bytes from instruction array
+                begin : instr_read_block
+                    reg [31:0] base;
+                    reg [31:0] idx;
+                    base = block_base(iInstrAddr) - INSTR_BASE;
+                    for (ib = 0; ib < BLOCK_SIZE; ib = ib + 1) begin
+                        idx = base + ib;
+                        if (idx < INSTR_SIZE)
+                            oInstrBlock[ib*8 +: 8] <= rInstrMem[idx];
+                        else
+                            oInstrBlock[ib*8 +: 8] <= 8'h0;
+                    end
                 end
-            end else begin
-                r_count <= r_count - 1;
-                o_valid <= 0;
+                oInstrReady <= 1'b1;
             end
         end
     end
-end
+
+    // ----------------------------------------------------------------
+    // Data port – combinational read / synchronous write-back
+    // ----------------------------------------------------------------
+    integer db;
+    always @(posedge i_clk or negedge i_rstn) begin
+        if (!i_rstn) begin
+            oDataBlock <= 0;
+            oDataReady <= 1'b0;
+        end else begin
+            oDataReady <= 1'b0;
+            if (iDataReq) begin
+                begin : data_block_op
+                    reg [31:0] base;
+                    reg [31:0] idx;
+                    base = block_base(iDataAddr) - DATA_BASE;
+                    if (iDataWrite) begin
+                        // Write-back: store block bytes into data array
+                        for (db = 0; db < BLOCK_SIZE; db = db + 1) begin
+                            idx = base + db;
+                            if (idx < DATA_SIZE)
+                                rDataMem[idx] <= iDataBlock[db*8 +: 8];
+                        end
+                    end else begin
+                        // Read: fetch block from data array
+                        for (db = 0; db < BLOCK_SIZE; db = db + 1) begin
+                            idx = base + db;
+                            if (idx < DATA_SIZE)
+                                oDataBlock[db*8 +: 8] <= rDataMem[idx];
+                            else
+                                oDataBlock[db*8 +: 8] <= 8'h0;
+                        end
+                    end
+                end
+                oDataReady <= 1'b1;
+            end
+        end
+    end
 
 endmodule

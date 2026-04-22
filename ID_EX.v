@@ -1,6 +1,6 @@
 module ID_EX (
-    input         iClk,
-    input         iRstN,
+    input         i_clk,
+    input         i_rstn,
     input         iFlush,
     input         iStall,
 
@@ -13,7 +13,7 @@ module ID_EX (
     // MEM controls
     input         iMemRd,
     input         iMemWr,
-    input  [2:0]  iFunct3,
+    input  [2:0]  i_funct,
 
     // EX controls
     input  [2:0]  iAluOp,
@@ -57,8 +57,8 @@ module ID_EX (
     output reg [4:0]  oRs2,
     output reg [4:0]  oRd
 );
-    always @(posedge iClk or negedge iRstN) begin
-        if (!iRstN || iFlush || iStall) begin
+    always @(posedge i_clk or negedge i_rstn) begin
+        if (!i_rstn || iFlush || iStall) begin
             oRegWrite <= 0; oMemtoReg <= 0; oJump <= 0; oLui <= 0;
             oMemRd    <= 0; oMemWr    <= 0; oFunct3 <= 0;
             oAluOp    <= 0; oAluSrc1  <= 0; oAluSrc2 <= 0;
@@ -70,7 +70,7 @@ module ID_EX (
             oRegWrite <= iRegWrite; oMemtoReg <= iMemtoReg;
             oJump     <= iJump;     oLui      <= iLui;
             oMemRd    <= iMemRd;    oMemWr    <= iMemWr;
-            oFunct3   <= iFunct3;
+            oFunct3   <= i_funct;
             oAluOp    <= iAluOp;    oAluSrc1  <= iAluSrc1;
             oAluSrc2  <= iAluSrc2;  oBranch   <= iBranch;
             oPcSrc    <= iPcSrc;

@@ -1,43 +1,29 @@
-`timescale 1ns/1ps
-
-// RISCV_TOP.v  (Phase 6 - with Instruction Cache and Data Cache)
-// Extends Phase 5 forwarded pipeline with cache-backed memory:
-//   - INSTRUCTION_CACHE replaces INSTRUCTION_MEMORY
-//   - DATA_CACHE replaces DATA_MEMORY / MEM_STAGE
-//   - Pipeline stalls on any cache miss
-
 module RISCV_TOP (
-    input iClk,
-    input iRstN
+    input i_clk,
+    input i_rstn
 );
 
 // =============================================================
 // STALL / FLUSH signals
 // =============================================================
-wire wHazardStall;     // load-use stall from hazard unit
-wire wIDEX_Bubble;     // hazard unit bubble into ID/EX
-wire wFlush;           // branch/jump flush from EX stage (1-cycle penalty)
+wire wHazardStall_raw;  // load-use stall from hazard unit (ungated)
+wire wIDEX_Bubble_raw;  // hazard bubble into ID/EX (ungated)
+wire wICacheStall;      // instruction cache miss stall
+wire wDCacheStall;      // data cache miss stall
+wire wFlush;            // branch/jump flush from EX stage (1-cycle penalty)
 
-wire wICStall;         // instruction cache miss stall
-wire wDCStall;         // data cache miss stall
-wire wCacheStall;      // any cache miss stall
-wire wTotalStall;      // combined: hazard + any cache miss
+// Gate hazard unit off during any cache miss so it cannot inject spurious
+// bubbles into the frozen instruction stream
+wire wCacheStall  = wICacheStall | wDCacheStall;
+wire wHazardStall = wHazardStall_raw & ~wCacheStall;
+wire wIDEX_Bubble = wIDEX_Bubble_raw & ~wCacheStall;
 
-assign wCacheStall = wICStall | wDCStall;
-assign wTotalStall = wHazardStall | wCacheStall;
-
-// Forward declarations used by HAZARD and FORWARDING (outputs of later modules)
-wire        wEXMEM_RegWrite;
-wire [4:0]  wEXMEM_Rd;
-wire        wEXMEM_MemRd;
-wire        wMEMWB_RegWrite;
-wire [4:0]  wMEMWB_Rd;
-wire [31:0] wEXMEM_AluResult;
-wire [4:0]  wIDEX_Rs1;
-wire [4:0]  wIDEX_Rs2;
+// Any stall freezes PC and IF/ID
+wire wStall = wHazardStall | wCacheStall;
 
 // =============================================================
 // IF STAGE   Program Counter
+// PC starts at 0x00400000 per Phase 6 memory map
 // =============================================================
 reg  [31:0] wPC;
 wire [31:0] wNextPC;
@@ -46,43 +32,64 @@ wire [31:0] wInstr_raw;
 
 assign wPCPlus4_IF = wPC + 32'd4;
 
-always @(posedge iClk or negedge iRstN) begin
-    if (!iRstN)
-        wPC <= 32'h00400000;
-    else if (!wTotalStall)
+always @(posedge i_clk or negedge i_rstn) begin
+    if (!i_rstn)
+        wPC <= 32'h00400000;      // Phase 6: text segment base
+    else if (!wStall)
         wPC <= wNextPC;
 end
 
-// Instruction cache: read every cycle with current PC
-wire        wICStall_raw;
+// =============================================================
+// Instruction Cache
+// =============================================================
+wire [31:0]      wICache_MemAddr;
+wire             wICache_MemReq;
+wire [64*8-1:0]  wICache_MemRdBlock;
+wire             wICache_MemReady;
 
-INSTRUCTION_CACHE #(
-    .EVICT_POLICY (0),
-    .WAYS         (4),
-    .CACHE_SIZE   (4096),
-    .BLOCK_SIZE   (64)
-) instruction_cache (
-    .i_clk   (iClk),
-    .i_rstn  (iRstN),
-    .i_addr  (wPC),
-    .i_read  (1'b1),
-    .o_data  (wInstr_raw),
-    .o_stall (wICStall_raw)
+CACHE #(
+    .CACHE_SIZE (4096),
+    .BLOCK_SIZE (64),
+    .WAYS       (4),
+    .IS_INSTR   (1)
+) instr_cache (
+    .i_clk          (i_clk),
+    .i_rstn         (i_rstn),
+
+    .i_addr         (wPC),
+    .i_cpu_data     (32'b0),
+    .i_funct        (3'b010),
+    .i_read         (!wICacheStall),   // don't re-request while already missing
+    .i_write        (1'b0),
+
+    .i_mem_ready    (wICache_MemReady),
+    .i_mem_valid    (1'b0),
+    .i_mem_rd_data  (wICache_MemRdBlock),
+
+    .o_hit          (),
+    .o_miss         (),
+    .o_cpu_data     (wInstr_raw),
+    .o_stall        (wICacheStall),
+
+    .o_mem_rd       (wICache_MemReq),
+    .o_mem_wr       (),
+    .o_mem_rd_addr  (wICache_MemAddr),
+    .o_mem_wr_addr  (),
+    .o_mem_wr_data  ()
 );
-
-assign wICStall = wICStall_raw;
 
 // =============================================================
 // IF/ID Pipeline Register
+// wInstr and wPc match signals.yaml ("wInstr") ("wPc")
 // =============================================================
 reg [31:0] wInstr;
 reg [31:0] wPc;
 
-always @(posedge iClk or negedge iRstN) begin
-    if (!iRstN || wFlush) begin
+always @(posedge i_clk or negedge i_rstn) begin
+    if (!i_rstn || wFlush) begin
         wInstr <= 32'h00000013;
-        wPc    <= 32'b0;
-    end else if (!wTotalStall) begin
+        wPc    <= 32'h00400000;
+    end else if (!wStall) begin
         wInstr <= wInstr_raw;
         wPc    <= wPC;
     end
@@ -139,13 +146,13 @@ wire [31:0] wRs1Data_ID;
 wire [31:0] wRs2Data_ID;
 
 REGISTER register (
-    .iClk       (iClk),
-    .iRstN      (iRstN),
+    .i_clk       (i_clk),
+    .i_rstn      (i_rstn),
     .iWriteEn   (wWbRegWrite),
     .iRdAddr    (wWbRd),
     .iRs1Addr   (wRs1_ID),
     .iRs2Addr   (wRs2_ID),
-    .iWriteData (wWbData),
+    .i_cpu_data (wWbData),
     .oRs1Data   (wRs1Data_ID),
     .oRs2Data   (wRs2Data_ID)
 );
@@ -156,7 +163,6 @@ REGISTER register (
 wire [4:0] wIDEX_Rd;
 wire       wIDEX_MemRd;
 
-// Track whether ID/EX is a bubble
 wire wIDEX_IsBubble = !wIDEX_RegWrite && !wIDEX_MemRd && !wIDEX_MemWr &&
                       !wIDEX_Branch && !wIDEX_Jump;
 
@@ -171,8 +177,8 @@ HAZARD hd (
     .iIDEX_Rs1     (wIDEX_Rs1),
     .iIDEX_Rs2     (wIDEX_Rs2),
     .iIFID_MemWr   (wCtrl_MemWr),
-    .oStall        (wHazardStall),
-    .oIDEX_Flush   (wIDEX_Bubble)
+    .oStall        (wHazardStall_raw),
+    .oIDEX_Flush   (wIDEX_Bubble_raw)
 );
 
 // ID/EX flush = load-use bubble OR branch/jump flush
@@ -188,12 +194,13 @@ wire [2:0]  wIDEX_AluOp;
 wire        wIDEX_AluSrc1, wIDEX_AluSrc2, wIDEX_Branch, wIDEX_PcSrc;
 wire [31:0] wIDEX_PC, wIDEX_Rs1Data, wIDEX_Rs2Data, wIDEX_Imm;
 wire [6:0]  wIDEX_Funct7;
+wire [4:0]  wIDEX_Rs1, wIDEX_Rs2;
 
 ID_EX id_stage_reg (
-    .iClk      (iClk),
-    .iRstN     (iRstN),
+    .i_clk      (i_clk),
+    .i_rstn     (i_rstn),
     .iFlush    (wIDEX_Flush),
-    .iStall    (wCacheStall),   // freeze ID/EX on cache miss
+    .iStall    (wStall),
 
     .iRegWrite (wCtrl_RegWrite),
     .iMemtoReg (wCtrl_MemtoReg),
@@ -201,7 +208,7 @@ ID_EX id_stage_reg (
     .iLui      (wCtrl_Lui),
     .iMemRd    (wCtrl_MemRd),
     .iMemWr    (wCtrl_MemWr),
-    .iFunct3   (wFunct3_ID),
+    .i_funct   (wFunct3_ID),
     .iAluOp    (wCtrl_AluOp),
     .iAluSrc1  (wCtrl_AluSrc1),
     .iAluSrc2  (wCtrl_AluSrc2),
@@ -244,6 +251,12 @@ ID_EX id_stage_reg (
 // EX STAGE
 // =============================================================
 
+wire        wEXMEM_RegWrite;
+wire [4:0]  wEXMEM_Rd;
+wire        wMEMWB_RegWrite;
+wire [4:0]  wMEMWB_Rd;
+wire [31:0] wEXMEM_AluResult;
+
 wire [1:0] wForwardA, wForwardB;
 
 FORWARDING fwd (
@@ -258,7 +271,6 @@ FORWARDING fwd (
     .oForwardB       (wForwardB)
 );
 
-// Select correct EX/MEM forwarding data
 wire [31:0] wEXMEM_FwdData = wEXMEM_Jump ? wEXMEM_PCPlus4 :
                               wEXMEM_Lui  ? wEXMEM_Imm     :
                                             wEXMEM_AluResult;
@@ -297,7 +309,7 @@ wire        wAluZero;
 
 ALU_CONTROL alu_control (
     .iAluOp   (wIDEX_AluOp),
-    .iFunct3  (wIDEX_Funct3),
+    .i_funct  (wIDEX_Funct3),
     .iFunct7  (wIDEX_Funct7),
     .oAluCtrl (wAluCtrl)
 );
@@ -334,26 +346,25 @@ wire [31:0] wIDEX_PCPlus4;
 assign wIDEX_PCPlus4 = wIDEX_PC + 32'd4;
 
 // =============================================================
-// EX/MEM Pipeline Register  (Phase 6: adds iStall)
+// EX/MEM Pipeline Register
 // =============================================================
 wire        wEXMEM_MemtoReg, wEXMEM_Jump, wEXMEM_Lui;
-wire        wEXMEM_MemWr;
+wire        wEXMEM_MemRd, wEXMEM_MemWr;
 wire [2:0]  wEXMEM_Funct3;
 wire [31:0] wEXMEM_Rs2Data, wEXMEM_PCPlus4, wEXMEM_Imm;
 
 EX_MEM ex_stage (
-    .iClk      (iClk),
-    .iRstN     (iRstN),
+    .i_clk      (i_clk),
+    .i_rstn     (i_rstn),
     .iFlush    (1'b0),
-    .iStall    (wCacheStall),   // freeze on cache miss
-
+    .iStall    (wDCacheStall),
     .iRegWrite (wIDEX_RegWrite),
     .iMemtoReg (wIDEX_MemtoReg),
     .iJump     (wIDEX_Jump),
     .iLui      (wIDEX_Lui),
     .iMemRd    (wIDEX_MemRd),
     .iMemWr    (wIDEX_MemWr),
-    .iFunct3   (wIDEX_Funct3),
+    .i_funct   (wIDEX_Funct3),
 
     .iAluResult    (wAluResult_EX),
     .iRs2Data      (wAluIn2_fwd),
@@ -377,43 +388,86 @@ EX_MEM ex_stage (
 );
 
 // =============================================================
-// MEM STAGE  (Phase 6: DATA_CACHE replaces DATA_MEMORY)
+// MEM STAGE  –  Data Cache sits in front of main memory
 // =============================================================
+wire [31:0]      wDCache_MemRdAddr;
+wire [31:0]      wDCache_MemWrAddr;
+wire             wDCache_MemReq;
+wire             wDCache_MemWrite;
+wire [64*8-1:0]  wDCache_MemWrBlock;
+wire [64*8-1:0]  wDCache_MemRdBlock;
+wire             wDCache_MemReady;
+wire [31:0]      wMemReadData;
 
-wire [31:0] wMemReadData;
-wire        wDCStall_raw;
-
-DATA_CACHE #(
-    .EVICT_POLICY (0),
-    .WAYS         (4),
-    .CACHE_SIZE   (4096),
-    .BLOCK_SIZE   (64)
+CACHE #(
+    .CACHE_SIZE (4096),
+    .BLOCK_SIZE (64),
+    .WAYS       (4),
+    .IS_INSTR   (0)
 ) data_cache (
-    .i_clk    (iClk),
-    .i_rstn   (iRstN),
-    .i_addr   (wEXMEM_AluResult),
-    .i_wdata  (wEXMEM_Rs2Data),
-    .i_funct3 (wEXMEM_Funct3),
-    .i_read   (wEXMEM_MemRd),
-    .i_write  (wEXMEM_MemWr),
-    .o_rdata  (wMemReadData),
-    .o_stall  (wDCStall_raw)
+    .i_clk          (i_clk),
+    .i_rstn         (i_rstn),
+
+    .i_addr         (wEXMEM_AluResult),
+    .i_cpu_data     (wEXMEM_Rs2Data),
+    .i_funct        (wEXMEM_Funct3),
+    .i_read         (wEXMEM_MemRd),
+    .i_write        (wEXMEM_MemWr),
+
+    .i_mem_ready    (wDCache_MemReady),
+    .i_mem_valid    (1'b0),
+    .i_mem_rd_data  (wDCache_MemRdBlock),
+
+    .o_hit          (),
+    .o_miss         (),
+    .o_cpu_data     (wMemReadData),
+    .o_stall        (wDCacheStall),
+
+    .o_mem_rd       (wDCache_MemReq),
+    .o_mem_wr       (wDCache_MemWrite),
+    .o_mem_rd_addr  (wDCache_MemRdAddr),
+    .o_mem_wr_addr  (wDCache_MemWrAddr),
+    .o_mem_wr_data  (wDCache_MemWrBlock)
 );
 
-assign wDCStall = wDCStall_raw;
+// =============================================================
+// Unified Main Memory  (backing store for both caches)
+// =============================================================
+MAIN_MEMORY #(
+    .BLOCK_SIZE (64),
+    .INSTR_SIZE (65536),
+    .DATA_SIZE  (196608)
+) main_memory (
+    .i_clk          (i_clk),
+    .i_rstn         (i_rstn),
+
+    // Instruction cache port
+    .iInstrAddr    (wICache_MemAddr),
+    .iInstrReq     (wICache_MemReq),
+    .oInstrBlock   (wICache_MemRdBlock),
+    .oInstrReady   (wICache_MemReady),
+
+    // Data cache port
+    // MAIN_MEMORY uses a single address port; mux read vs write-back address
+    .iDataAddr     (wDCache_MemWrite ? wDCache_MemWrAddr : wDCache_MemRdAddr),
+    .iDataReq      (wDCache_MemReq | wDCache_MemWrite),
+    .iDataWrite    (wDCache_MemWrite),
+    .iDataBlock    (wDCache_MemWrBlock),
+    .oDataBlock    (wDCache_MemRdBlock),
+    .oDataReady    (wDCache_MemReady)
+);
 
 // =============================================================
-// MEM/WB Pipeline Register  (Phase 6: adds iStall)
+// MEM/WB Pipeline Register
 // =============================================================
 wire        wMEMWB_MemtoReg, wMEMWB_Jump, wMEMWB_Lui;
 wire [31:0] wMEMWB_AluResult, wMEMWB_MemReadData;
 wire [31:0] wMEMWB_PCPlus4, wMEMWB_Imm;
 
 MEM_WB wb_stage (
-    .iClk         (iClk),
-    .iRstN        (iRstN),
-    .iStall       (wCacheStall),   // freeze on cache miss
-
+    .i_clk         (i_clk),
+    .i_rstn        (i_rstn),
+    .iStall        (wDCacheStall),
     .iRegWrite    (wEXMEM_RegWrite),
     .iMemtoReg    (wEXMEM_MemtoReg),
     .iJump        (wEXMEM_Jump),

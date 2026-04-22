@@ -1,6 +1,6 @@
 module IF_ID (
-    input         iClk,
-    input         iRstN,
+    input         i_clk,
+    input         i_rstn,
     input         iFlush,
     input         iStall,
     input  [31:0] iPC,
@@ -8,8 +8,8 @@ module IF_ID (
     output reg [31:0] oPC,
     output reg [31:0] oInstr
 );
-    always @(posedge iClk or negedge iRstN) begin
-        if (!iRstN || iFlush) begin
+    always @(posedge i_clk or negedge i_rstn) begin
+        if (!i_rstn || iFlush) begin
             oPC    <= 32'b0;
             oInstr <= 32'b0;
         end else if (!iStall) begin

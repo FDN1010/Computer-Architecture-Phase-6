@@ -1,12 +1,7 @@
-`timescale 1ns/1ps
-
-// EX_MEM.v  (Phase 6: adds iStall input for cache stall support)
-
 module EX_MEM (
-    input         iClk,
-    input         iRstN,
+    input         i_clk,
+    input         i_rstn,
     input         iFlush,
-    input         iStall,   // freeze register when 1
 
     // WB
     input         iRegWrite,
@@ -17,7 +12,7 @@ module EX_MEM (
     // MEM
     input         iMemRd,
     input         iMemWr,
-    input  [2:0]  iFunct3,
+    input  [2:0]  i_funct,
 
     // Data
     input  [31:0] iAluResult,
@@ -41,17 +36,17 @@ module EX_MEM (
     output reg [31:0] oImm,
     output reg [4:0]  oRd
 );
-    always @(posedge iClk or negedge iRstN) begin
-        if (!iRstN || iFlush) begin
+    always @(posedge i_clk or negedge i_rstn) begin
+        if (!i_rstn || iFlush) begin
             oRegWrite  <= 0; oMemtoReg <= 0; oJump <= 0; oLui <= 0;
             oMemRd     <= 0; oMemWr    <= 0; oFunct3 <= 0;
             oAluResult <= 0; oRs2Data  <= 0; oPCPlus4 <= 0;
             oImm       <= 0; oRd       <= 0;
-        end else if (!iStall) begin
+        end else begin
             oRegWrite  <= iRegWrite;  oMemtoReg <= iMemtoReg;
             oJump      <= iJump;      oLui      <= iLui;
             oMemRd     <= iMemRd;     oMemWr    <= iMemWr;
-            oFunct3    <= iFunct3;
+            oFunct3    <= i_funct;
             oAluResult <= iAluResult; oRs2Data  <= iRs2Data;
             oPCPlus4   <= iPCPlus4;   oImm      <= iImm;
             oRd        <= iRd;
